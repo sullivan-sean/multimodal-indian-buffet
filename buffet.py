@@ -1,231 +1,238 @@
 import numpy as np
-import scipy.stats as stats
-from types import SimpleNamespace
-from scipy.special import expit, gammaln
-from scipy.linalg import block_diag
+from scipy.stats import poisson, gamma
+from scipy.special import gammaln, expit
 from tqdm import tqdm_notebook
-
-# We will be taking log(0) = -Inf, so turn off this warning
-np.seterr(divide='ignore')
+from types import SimpleNamespace
 
 
 def lnfact(x):
     return gammaln(x + 1)
 
 
-def gamma(var, f=None):
-    var, a, b = var if isinstance(var, tuple) else (var, None, None)
-    return Gamma(var, a=a, b=b, f=f)
-
-
-class Gamma(float):
-    def __init__(self, val, a=None, b=None, f=None):
-        super().__init__()
-        f = (lambda x: x) if f is None else f
-        self.a, self.b, self.f = a, b, f
-        self.is_dist = self.a is not None and self.b is not None
+class Gamma:
+    def __init__(self, params):
+        params = params if isinstance(params, tuple) else (params, None, None)
+        val, a, b = params
+        self.a = a
+        self.b = b
+        self.is_dist = a is not None and b is not None
+        self.val = val
 
     def sample(self, a, b):
-        if self.is_dist:
-            new_val = stats.gamma.rvs(self.a + a, scale=1 / self.b + b)
-            return Gamma(self.f(new_val), a=self.a, b=self.b, f=self.f)
-        return self
+        return gamma.rvs(self.a + a, scale=1 / (self.b + b))
 
 
 class Feature:
-    def __init__(self, data, var_x, var_w):
+    def __init__(self, data, sigma_x, sigma_w):
         self.X = data
-        self.N, self.D = self.X.shape
+        self.XXT = self.X.T @ self.X
+        self.N, self.D = data.shape
 
-        self.var_x = gamma(var_x, f=lambda a: 1 / a)
-        self.var_w = gamma(var_w, f=lambda a: 1 / a)
+        self.sigma_x = Gamma(sigma_x)
+        self.sigma_w = Gamma(sigma_w)
 
-        self.W = None
+        self.var_x = self.sigma_x.val ** 2
+        self.var_w = self.sigma_w.val ** 2
 
-    def set_weights(self, Z):
-        # dist of W over P(W | Z, X)
-        R = self.get_R(Z)
+        self.W = SimpleNamespace(mu=None, sigma=None, h=None, info=None)
 
-        mu = R @ Z.T @ self.X
-        sigma = self.var_x * R
-        info = np.linalg.inv(sigma)
-        h = info @ mu
+    def log_likelihood_xi(self, zi, i, noise=0):
+        # mu and sigma for xi using dist of W
+        mu = zi @ self.W.mu
+        sigma = zi @ self.W.sigma @ zi.T + self.var_x + noise * self.var_w
 
-        self.W = SimpleNamespace(mu=mu, sigma=sigma, info=info, h=h)
+        # log likelihood for single xi
+        ll = self.D * np.log(sigma) + np.power(self.X[i] - mu, 2).sum() / sigma
+        return -ll / 2
 
-    def update_weights(self, zi, xi, sub=False):
-        zi, xi = zi.reshape(1, -1), xi.reshape(1, -1)
-        sub = -1 if sub else 1
+    def calc_M(self, Z):
+        # M = (Z'Z + sigma_x^2 / sigma_w^2 * I)^-1
+        K = Z.shape[1]
+        return np.linalg.inv(Z.T @ Z + self.var_x / self.var_w * np.eye(K))
 
-        self.W.info += sub * zi.T @ zi / self.var_x
-        self.W.h += sub * zi.T @ xi / self.var_x
+    def log_likelihood(self, Z):
+        _, K = Z.shape
+        M = self.calc_M(Z)
+        lp = -self.N * np.log(2 * np.pi * self.var_x)
+        lp -= K * np.log(self.var_w / self.var_x)
+        lp += np.log(np.linalg.det(M))
+        XZ = self.X.T @ Z
+        lp = lp * self.D - np.trace(self.XXT - XZ @ M @ XZ.T) / self.var_x
+        return lp / 2
 
-        self.W.sigma = np.linalg.inv(self.W.info)
-        self.W.mu = self.W.sigma @ self.W.h
+    def sample_sigma(self, Z):
+        if self.sigma_w.is_dist or self.sigma_x.is_dist:
+            W_mu, W_sigma = self.post_W(Z)
 
-    def get_R(self, Z):
-        # where R = (Z'Z + var_x / var_w * I)^-1
-        ZZI = Z.T @ Z + self.var_x / self.var_w * np.eye(Z.shape[1])
-        return np.linalg.inv(ZZI)
+        if self.sigma_x.is_dist:
+            var_x = self.D * (Z @ W_sigma @ Z.T).diagonal().sum()
+            var_x += ((self.X - Z @ W_mu) ** 2).sum()
+            n = self.N * self.D / 2
+            self.var_x = 1 / self.sigma_x.sample(n, var_x / 2)
 
-    def sample_vars(self, Z):
-        if self.var_w.is_dist or self.var_x.is_dist:
-            self.set_weights(Z)
+        if self.sigma_w.is_dist:
+            var_w = W_sigma.trace() * self.D + np.power(W_mu, 2).sum()
+            n = Z.shape[1] * self.D / 2
+            self.var_w = 1 / self.sigma_w.sample(n, var_w / 2)
 
-        if self.var_x.is_dist:
-            vs = (Z @ self.W.sigma @ Z.T).diagonal().sum()
+    def post_W(self, Z):
+        # mean and covariange of W
+        M = self.calc_M(Z)
+        return M @ Z.T @ self.X, self.var_x * M
 
-            v_x = np.power(self.X - Z @ self.W.mu, 2).sum() + self.D * vs
-            n_x = self.N * self.D
-            self.var_x = self.var_x.sample(n_x / 2, v_x / 2)
+    def weights(self, Z):
+        # E(W|X,Z)
+        return self.post_W(Z)[0]
 
-        if self.var_w.is_dist:
-            _, K = Z.shape
-            v_a = self.W.sigma.trace() * self.D + np.power(self.W.mu, 2).sum()
-            n_a = K * self.D
-            self.var_w = self.var_w.sample(n_a / 2, v_a / 2)
-
-    def likelihood_Xi(self, Z, i, diff=None):
-        zi = Z[i]
-        xi = self.X[i]
-
-        mean = zi @ self.W.mu
-        sigma = zi @ self.W.sigma @ zi.T + self.var_x
-
-        sigmas = [sigma]
-
-        if diff is not None:
-            sigmas.append(sigma + diff * self.var_w)
-
-        p = np.power(xi - mean, 2).sum()
-        lls = [(self.D * np.log(sigma) + p / sigma) / -2 for sigma in sigmas]
-
-        return lls if diff is not None else lls[0]
+    def update(self, zi, i, sub=False):
+        sub = 1 if sub else -1
+        self.W.info += sub * np.outer(zi, zi) / self.var_x
+        self.W.h += sub * np.outer(zi, self.X[i]) / self.var_x
 
 
 class IndianBuffet:
-    def __init__(self, data, alpha, var_xs, var_ws):
-        self.feats = [Feature(X, var_x, var_w) for X, var_x, var_w in zip(data, var_xs, var_ws)]
+    def __init__(self, data, alpha, sigma_xs, sigma_ws):
         self.N = data[0].shape[0]
+        self.feats = [Feature(d, sx, sw) for d, sx, sw in zip(data, sigma_xs, sigma_ws)]
 
-        self.alpha = gamma(alpha)
+        self.alpha_dist = Gamma(alpha)
+        self.alpha = self.alpha_dist.val
 
         self.init_z()
+        self.Zs = []
 
     def init_z(self):
         Z = np.ones((0, 0))
         for i in range(1, self.N + 1):
-            zi = np.random.uniform(0, 1, (1, Z.shape[1])) < Z.sum(axis=0) / i
-            k = stats.poisson.rvs(self.alpha / i)
+            zi = np.random.uniform(0, 1, Z.shape[1]) < Z.sum(axis=0) / i
+            k = poisson.rvs(self.alpha / i)
             Z = np.block([[Z, np.zeros((Z.shape[0], k))], [zi, np.ones((1, k))]])
         self.Z = Z
         self.K = Z.shape[1]
-        self.M = Z.sum(axis=0)
+        self.m = Z.sum(axis=0)
 
-    def gibbs_sample(self):
-        self.sample_z()
+    def prior(self):
+        logp = self.K * np.log(self.alpha)
+        logp -= lnfact(np.unique(self.Z, axis=1, return_counts=True)[1]).sum()
+        logp -= (self.alpha / np.arange(1, self.N + 1)).sum()
+        facts = lnfact(self.N - self.m) + lnfact(self.m - 1) - lnfact(self.N)
+        return logp + facts.sum()
 
-        if self.alpha.is_dist:
-            self.alpha = self.alpha.sample(self.Z.sum(), self.N)
+    def log_posterior(self):
+        return self.prior() + sum(f.log_likelihood(self.Z) for f in self.feats)
+
+    def add_features(self, k, i):
+        self.Z = np.hstack((self.Z, np.zeros((self.N, k))))
+        self.Z[i, self.K:] = 1
+        self.m = np.hstack((self.m, np.ones(k)))
 
         for feat in self.feats:
-            feat.sample_vars(self.Z)
+            zero = np.zeros((self.K, k))
+            feat.W.info = np.block([[feat.W.info, zero], [zero.T, np.eye(k) / feat.var_w]])
+            feat.W.h = np.vstack((feat.W.h, np.zeros((k, feat.D))))
+        self.K += k
+
+    def remove_features(self, cols):
+        self.Z = np.delete(self.Z, cols, axis=1)
+        self.m = np.delete(self.m, cols)
+        self.K -= len(cols)
+
+        for feat in self.feats:
+            feat.W.info = np.delete(feat.W.info, cols, axis=0)
+            feat.W.info = np.delete(feat.W.info, cols, axis=1)
+            feat.W.h = np.delete(feat.W.h, cols, axis=0)
+
+    def log_likelihood_xi(self, *args, **kwargs):
+        return sum(f.log_likelihood_xi(*args, **kwargs) for f in self.feats)
 
     def sample_z(self):
-        """ Take single sample of latent features Z """
-        # for each data point
         order = np.random.permutation(self.N)
-
         for c, i in enumerate(order):
             if c % 5 == 0:
                 for feat in self.feats:
-                    feat.set_weights(self.Z)
+                    feat.W.mu, feat.W.sigma = feat.post_W(self.Z)
+                    feat.W.info = np.linalg.inv(feat.W.sigma)
+                    feat.W.h = feat.W.info @ feat.W.mu
 
-            # remove point from Z, M
+            zi = self.Z[i]
+
             for feat in self.feats:
-                feat.update_weights(self.Z[i], feat.X[i], sub=True)
-            mi = self.M - self.Z[i, :]
+                feat.update(zi, i, sub=True)
+                feat.W.sigma = np.linalg.inv(feat.W.info)
+                feat.W.mu = feat.W.sigma @ feat.W.h
 
-            singletons = np.nonzero(mi <= 0)[0]
+            # Remove point from counts
+            mi = self.m - zi
 
             lpz = np.log(np.stack((self.N - mi, mi)))
-
+            prev = np.copy(zi)
             for k in np.nonzero(mi > 0)[0]:
-                prev = self.Z[i, k]
+                zi[k] = 0
+                lp0 = lpz[0, k] + self.log_likelihood_xi(zi, i)
+                zi[k] = 1
+                lp1 = lpz[1, k] + self.log_likelihood_xi(zi, i)
+                zi[k] = int(np.random.uniform(0, 1) < expit(lp1 - lp0))
+            self.m += zi - prev
 
-                self.Z[i, k] = 0
-                lpz[0, k] += sum(f.likelihood_Xi(self.Z, i) for f in self.feats)
+            # Metropolis-Hastings step described in Meeds et al
+            netk = poisson.rvs(self.alpha / self.N) - np.count_nonzero(mi <= 0)
 
-                self.Z[i, k] = 1
-                lpz[1, k] += sum(f.likelihood_Xi(self.Z, i) for f in self.feats)
-
-                on = np.random.uniform(0, 1) < expit(lpz[1, k] - lpz[0, k])
-                self.Z[i, k] = int(on)
-                self.M[k] += self.Z[i, k] - prev  # assert = self.Z[:, k].sum()
-
-            print(self.M)
-            diff = stats.poisson.rvs(self.alpha / self.N) - len(singletons)
-
-            lpold, lpnew = 0, 0
-            for f in self.feats:
-                lpo, lpn = f.likelihood_Xi(self.Z, i, diff=diff)
-                lpold, lpnew = lpold + lpo, lpnew + lpn
-
+            # Calculate the loglikelihoods
+            lpold = self.log_likelihood_xi(zi, i)
+            lpnew = self.log_likelihood_xi(zi, i, noise=netk)
             lpaccept = min(0.0, lpnew - lpold)
             lpreject = np.log(max(1.0 - np.exp(lpaccept), 1e-100))
 
-            # run metropolis hastings to add or remove features by diff
             if np.random.uniform(0, 1) < expit(lpaccept - lpreject):
-                if diff > 0:
-                    self.Z = np.hstack((self.Z, np.zeros((self.N, diff))))
-                    self.Z[i, self.K:] = 1
-                    self.M = np.hstack((self.M, np.ones(diff)))
-                    for f in self.feats:
-                        f.W.info = block_diag(f.W.info, np.eye(diff) / f.var_w)
-                        f.W.h = np.vstack((f.W.h, np.zeros((diff, f.D))))
-                    self.K += diff
-                elif diff < 0:
-                    dead = [ki for ki in singletons[:-diff]]
-                    self.K -= len(dead)
-                    self.Z = np.delete(self.Z, dead, axis=1)
-                    self.M = np.delete(self.M, dead)
-                    for f in self.feats:
-                        f.W.info = np.delete(f.W.info, dead, axis=0)
-                        f.W.info = np.delete(f.W.info, dead, axis=1)
-                        f.W.h = np.delete(f.W.h, dead, axis=0)
+                if netk > 0:
+                    self.add_features(netk, i)
+                elif netk < 0:
+                    empty = np.nonzero(mi <= 0)[0]
+                    self.remove_features(empty[:-netk])
 
-            # add point back in
-            for f in self.feats:
-                f.update_weights(self.Z[i], f.X[i])
+            for feat in self.feats:
+                feat.update(self.Z[i], i)
+
+    def gibbs_sample(self):
+        self.sample_z()
+        if self.alpha_dist.is_dist:
+            self.alpha = self.alpha_dist.sample(self.m.sum(), self.N)
+        for feat in self.feats:
+            feat.sample_sigma(self.Z)
 
     def run_sampler(self, iters=5000, burn_in=3000, thin=10):
-        Zs = []
+        self.Zs = []
         for i in tqdm_notebook(range(iters)):
             self.gibbs_sample()
             print(self.K)
             if i > burn_in and i % thin == 0:
-                Zs.append(self.Z)
-        return Zs
+                self.Zs.append(np.copy(self.Z))
+        return self.Zs
 
-    def likelihood_Xs(self, Z):
-        # P(X | Z)
-        lp = 0
-        for feat in self.feats:
-            R = feat.get_R(Z)
-            lp -= self.N * feat.D * np.log(2 * np.pi * feat.var_x)
-            lp -= self.K * feat.D * np.log(feat.var_w / feat.var_x)
-            lp -= feat.D * np.log(np.linalg.det(R))
-            IZRZ = np.eye(self.N) - Z @ R @ Z.T
-            lp -= np.trace(feat.X.T @ IZRZ @ feat.X) / feat.var_x
-        return lp / 2
+    def predict(self, Xs, k=None):
+        best = (-float('inf'), None, None)
+        for Z in self.Zs:
+            # calculate log prior over each row
+            m = Z.sum(axis=0) - Z
+            ps = np.where(Z == 1, m, self.N - m) / self.N
+            lps = np.sum(np.log(ps), axis=1)
 
-    def prior_Z(self):
-        # P(Z | alpha)
-        logp = self.K * np.log(self.alpha)
-        logp -= lnfact(np.unique(self.Z, axis=1, return_counts=True)[1]).sum()
-        logp -= (self.alpha / np.arange(1, self.N + 1)).sum()
-        facts = lnfact(self.N - self.M) + lnfact(self.M - 1) - lnfact(self.N)
-        return logp + facts.sum()
+            for f, X in zip(self.feats[:-1], Xs[:-1]):
+                # update prior with likelihood as mv normal centered at Z @ E(W | Z)
+                X_bar = Z @ f.weights(Z)
+                diffs = np.sum((X - X_bar) ** 2, axis=1) / (2 * f.var_x)
+                lps -= diffs + np.log(2 * np.pi) / 2 + np.log(f.var_x) * f.D / 2
+            i = np.argmax(lps)
 
-    def ll(self):
-        return self.likelihood_Xs(self.Z) + self.prior_Z()
+            # Save result if z[i] is most probable generator of X
+            if lps[i] > best[0]:
+                best = lps[i], Z, i
+
+        best_lp, best_Z, best_i = best
+        W = self.feats[-1].weights(best_Z)
+        X_w_pred = best_Z[best_i] @ W
+
+        # print(X_w_pred, Xs[-1])
+        # print((best_i == k) == (Xs[-1][np.argmax(X_w_pred)] == 1))
+
+        return Xs[-1][np.argmax(X_w_pred)] == 1
