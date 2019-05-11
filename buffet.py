@@ -203,6 +203,7 @@ class IndianBuffet:
         self.Zs = []
         for i in tqdm_notebook(range(iters)):
             self.gibbs_sample()
+            print(self.K)
             if i > burn_in and i % thin == 0:
                 self.Zs.append(np.copy(self.Z))
         return self.Zs
