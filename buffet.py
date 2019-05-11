@@ -164,13 +164,12 @@ class IndianBuffet:
             # Remove point from counts
             mi = self.m - zi
 
-            lpz = np.log(np.stack((self.N - mi, mi)))
             prev = np.copy(zi)
             for k in np.nonzero(mi > 0)[0]:
                 zi[k] = 0
-                lp0 = lpz[0, k] + self.log_likelihood_xi(zi, i)
+                lp0 = np.log(self.N - mi[k]) + self.log_likelihood_xi(zi, i)
                 zi[k] = 1
-                lp1 = lpz[1, k] + self.log_likelihood_xi(zi, i)
+                lp1 = np.log(mi[k]) + self.log_likelihood_xi(zi, i)
                 zi[k] = int(np.random.uniform(0, 1) < expit(lp1 - lp0))
             self.m += zi - prev
 
@@ -204,7 +203,6 @@ class IndianBuffet:
         self.Zs = []
         for i in tqdm_notebook(range(iters)):
             self.gibbs_sample()
-            print(self.K)
             if i > burn_in and i % thin == 0:
                 self.Zs.append(np.copy(self.Z))
         return self.Zs
@@ -231,8 +229,5 @@ class IndianBuffet:
         best_lp, best_Z, best_i = best
         W = self.feats[-1].weights(best_Z)
         X_w_pred = best_Z[best_i] @ W
-
-        # print(X_w_pred, Xs[-1])
-        # print((best_i == k) == (Xs[-1][np.argmax(X_w_pred)] == 1))
 
         return Xs[-1][np.argmax(X_w_pred)] == 1
